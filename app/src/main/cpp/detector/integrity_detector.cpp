@@ -450,10 +450,30 @@ static bool isAddressInKnownLibrary(uintptr_t addr) {
     return false;
 }
 
+/**
+ * Safe memory read via /proc/self/mem.
+ * Android 10+ maps system library .text as XOM (eXecute-Only Memory), so direct
+ * pointer dereference on function addresses causes SIGSEGV (SEGV_ACCERR).
+ * Reading through /proc/self/mem bypasses this because the kernel has full access.
+ */
+static bool safeMemRead(uintptr_t addr, void* buf, size_t len) {
+    int fd = open("/proc/self/mem", O_RDONLY);
+    if (fd < 0) return false;
+    ssize_t ret = pread(fd, buf, len, (off_t)addr);
+    close(fd);
+    return ret == (ssize_t)len;
+}
+
 bool IntegrityDetector::checkInlineHook(uintptr_t func_addr) {
     if (func_addr == 0) return false;
 
-    const uint32_t* instructions = reinterpret_cast<const uint32_t*>(func_addr);
+    // Read function prologue via /proc/self/mem to avoid SIGSEGV on XOM pages.
+    // Up to 4 ARM64 instructions (16 bytes) or 2 ARM32 instructions (8 bytes).
+    uint32_t instr_buf[4];
+    if (!safeMemRead(func_addr, instr_buf, sizeof(instr_buf))) {
+        LOGD("Cannot read instructions at 0x%lx (likely XOM or unmapped), skipping", func_addr);
+        return false;
+    }
 
     // Detect hook trampoline patterns, then VERIFY the jump target.
     // Android libdl.so uses LDR X16+BR X16 stubs to forward to the linker — these are normal.
@@ -461,8 +481,8 @@ bool IntegrityDetector::checkInlineHook(uintptr_t func_addr) {
     // Key distinction: if target is in a known SO → system stub; if in anon memory → hook.
 
 #if defined(__aarch64__)
-    uint32_t instr0 = instructions[0];
-    uint32_t instr1 = instructions[1];
+    uint32_t instr0 = instr_buf[0];
+    uint32_t instr1 = instr_buf[1];
 
     // Pattern 1: LDR Xn, #offset; BR Xn
     if ((instr0 & 0xFF000000) == 0x58000000) { // LDR Xn, #literal
@@ -478,24 +498,17 @@ bool IntegrityDetector::checkInlineHook(uintptr_t func_addr) {
 
                 // Read the target pointer from the literal pool
                 uintptr_t target = 0;
-                // Safe read via /proc/self/mem
-                int fd = open("/proc/self/mem", O_RDONLY);
-                if (fd >= 0) {
-                    if (pread(fd, &target, sizeof(target), (off_t)literal_addr) == sizeof(target)) {
-                        // Check if target is in a known library
-                        if (isAddressInKnownLibrary(target)) {
-                            LOGD("LDR+BR at 0x%lx jumps to 0x%lx (known library) — system stub, not hook",
-                                 func_addr, target);
-                            close(fd);
-                            return false;  // Normal system PLT stub
-                        } else {
-                            LOGW("Inline hook at 0x%lx: LDR X%d+BR X%d → target 0x%lx (anonymous memory!)",
-                                 func_addr, rd, rn, target);
-                            close(fd);
-                            return true;  // Jump to anonymous memory = hook
-                        }
+                if (safeMemRead(literal_addr, &target, sizeof(target))) {
+                    // Check if target is in a known library
+                    if (isAddressInKnownLibrary(target)) {
+                        LOGD("LDR+BR at 0x%lx jumps to 0x%lx (known library) — system stub, not hook",
+                             func_addr, target);
+                        return false;  // Normal system PLT stub
+                    } else {
+                        LOGW("Inline hook at 0x%lx: LDR X%d+BR X%d → target 0x%lx (anonymous memory!)",
+                             func_addr, rd, rn, target);
+                        return true;  // Jump to anonymous memory = hook
                     }
-                    close(fd);
                 }
 
                 // If we can't read the target, report as suspicious
@@ -517,7 +530,7 @@ bool IntegrityDetector::checkInlineHook(uintptr_t func_addr) {
 
             // Check for more MOVK instructions to build full 64-bit address
             for (int i = 2; i < 4; i++) {
-                uint32_t next = instructions[i];
+                uint32_t next = instr_buf[i];
                 if ((next & 0xFFE0001F) == (0xF2C00000 | target_reg)) { // MOVK LSL#32
                     target |= ((uint64_t)((next >> 5) & 0xFFFF)) << 32;
                 } else if ((next & 0xFFE0001F) == (0xF2E00000 | target_reg)) { // MOVK LSL#48
@@ -537,8 +550,8 @@ bool IntegrityDetector::checkInlineHook(uintptr_t func_addr) {
     }
 
 #elif defined(__arm__)
-    uint32_t instr0 = instructions[0];
-    uint32_t instr1 = instructions[1];
+    uint32_t instr0 = instr_buf[0];
+    uint32_t instr1 = instr_buf[1];
 
     // LDR PC, [PC, #n]: direct PC load
     if ((instr0 & 0x0F7FF000) == 0x051FF000) {
@@ -547,15 +560,10 @@ bool IntegrityDetector::checkInlineHook(uintptr_t func_addr) {
         if (!(instr0 & (1 << 23))) offset = -offset;  // U bit
         uintptr_t target_ptr = func_addr + 8 + offset;  // PC+8 in ARM mode
         uintptr_t target = 0;
-        int fd = open("/proc/self/mem", O_RDONLY);
-        if (fd >= 0) {
-            if (pread(fd, &target, 4, (off_t)target_ptr) == 4) {
-                close(fd);
-                if (isAddressInKnownLibrary(target)) return false;  // Normal
-                LOGW("Inline hook at 0x%lx: LDR PC → 0x%lx (anonymous)", func_addr, target);
-                return true;
-            }
-            close(fd);
+        if (safeMemRead(target_ptr, &target, sizeof(uint32_t))) {
+            if (isAddressInKnownLibrary(target)) return false;  // Normal
+            LOGW("Inline hook at 0x%lx: LDR PC → 0x%lx (anonymous)", func_addr, target);
+            return true;
         }
         return true;  // Can't verify, report suspicious
     }
@@ -570,15 +578,10 @@ bool IntegrityDetector::checkInlineHook(uintptr_t func_addr) {
                 if (!(instr0 & (1 << 23))) offset = -offset;
                 uintptr_t target_ptr = func_addr + 8 + offset;
                 uintptr_t target = 0;
-                int fd = open("/proc/self/mem", O_RDONLY);
-                if (fd >= 0) {
-                    if (pread(fd, &target, 4, (off_t)target_ptr) == 4) {
-                        close(fd);
-                        if (isAddressInKnownLibrary(target)) return false;
-                        LOGW("Inline hook at 0x%lx: LDR+BX → 0x%lx (anonymous)", func_addr, target);
-                        return true;
-                    }
-                    close(fd);
+                if (safeMemRead(target_ptr, &target, sizeof(uint32_t))) {
+                    if (isAddressInKnownLibrary(target)) return false;
+                    LOGW("Inline hook at 0x%lx: LDR+BX → 0x%lx (anonymous)", func_addr, target);
+                    return true;
                 }
                 return true;
             }
